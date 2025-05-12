@@ -35,6 +35,78 @@ daily_api_key = os.getenv("DAILY_API_KEY", "")
 daily_api_url = os.getenv("DAILY_API_URL", "https://api.daily.co/v1")
 
 
+class SilenceMonitor:
+    """Class to monitor silence and handle prompts or call termination."""
+    
+    def __init__(self, tts, llm, transport, max_silence_prompts=3, silence_threshold=10):
+        self.tts = tts
+        self.llm = llm
+        self.transport = transport
+        self.max_silence_prompts = max_silence_prompts
+        self.silence_threshold = silence_threshold
+        self.number_of_seconds_between_replies = 0
+        self.number_of_silence_prompts = 0
+        self.monitor_task = None
+        self.duration = 0  # Total call duration in seconds
+        self.silence_events = 0  # Number of silence events detected
+
+    async def start_monitoring(self):
+        """Start monitoring silence."""
+        self.monitor_task = asyncio.create_task(self._increment_reply_timer())
+
+    async def stop_monitoring(self):
+        """Stop monitoring silence."""
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            try:
+                await self.monitor_task
+            except asyncio.CancelledError:
+                logger.debug("Silence monitoring task cancelled.")
+
+    async def reset_counters(self):
+        """Reset silence counters when a user responds."""
+        self.number_of_seconds_between_replies = 0
+        self.number_of_silence_prompts = 0
+        logger.info("Resetting silence counters.")
+
+    async def _increment_reply_timer(self):
+        """Increment the number_of_seconds_between_replies every second."""
+        while True:
+            await asyncio.sleep(1)  # Wait for 1 second
+            self.number_of_seconds_between_replies += 1
+            logger.debug(f"Seconds since last reply: {self.number_of_seconds_between_replies}")
+            self.duration += 1
+
+            if self.number_of_seconds_between_replies >= self.silence_threshold:
+                logger.debug(f"{self.silence_threshold} seconds have passed without a reply.")
+                self.number_of_seconds_between_replies = 0
+                await self._handle_silence()
+
+    async def _handle_silence(self):
+        """Handle silence by sending a prompt or terminating the call."""
+        self.number_of_silence_prompts += 1
+        self.silence_events += 1  # Increment silence events counter
+        if self.number_of_silence_prompts > self.max_silence_prompts:
+            logger.debug("Exceeded maximum silence prompts. Ending the call.")
+            await self.tts.say("You look busy. I will end the call. See you later.")
+            self.log_summary()
+            self.number_of_silence_prompts = 0
+            await self.llm.queue_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+           
+        else:
+            await self.tts.say("I am still here, waiting for your response.")
+            logger.info(f"Sent silence prompt {self.number_of_silence_prompts}/{self.max_silence_prompts}.")
+
+    def log_summary(self):
+        """Log a summary of the call."""
+        logger.info("Post-call summary:")
+        logger.info(f"Total call duration: {self.duration} seconds")
+        logger.info(f"Number of silence events: {self.silence_events}")
+        logger.info(f"Number of silence prompts sent: {self.number_of_silence_prompts}")
+
+
+# ------------ MAIN FUNCTION ------------
+
 async def main(
     room_url: str,
     token: str,
@@ -154,6 +226,9 @@ async def main(
     # Create pipeline task
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
+    # Initialize SilenceMonitor
+    silence_monitor = SilenceMonitor(tts, llm, transport)
+
     # ------------ EVENT HANDLERS ------------
 
     @transport.event_handler("on_first_participant_joined")
@@ -161,11 +236,20 @@ async def main(
         logger.debug(f"First participant joined: {participant['id']}")
         await transport.capture_participant_transcription(participant["id"])
         await task.queue_frames([context_aggregator.user().get_context_frame()])
+        # Start the silence monitor
+        await silence_monitor.start_monitoring()
 
     @transport.event_handler("on_participant_left")
     async def on_participant_left(transport, participant, reason):
         logger.debug(f"Participant left: {participant}, reason: {reason}")
         await task.cancel()
+        await silence_monitor.stop_monitoring()
+        silence_monitor.log_summary()  # Log the post-call summary when the user leaves
+
+    @transport.event_handler("on_transcription_message")
+    async def on_transcription_message(transport, transcription):
+        logger.info(f"Customer message: {transcription}")
+        await silence_monitor.reset_counters()
 
     # ------------ RUN PIPELINE ------------
 
